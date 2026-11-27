@@ -462,6 +462,9 @@ fn caption_text(encoded: &str) -> Option<String> {
         return None;
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded.chars().filter(|c| !c.is_whitespace()).collect::<String>()).ok()?;
+    if let Some(text) = styled_source_text(&bytes) {
+        return Some(text);
+    }
     let mut found = None;
     for i in 0..bytes.len().saturating_sub(4) {
         let len = u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?) as usize;
@@ -481,6 +484,22 @@ fn caption_text(encoded: &str) -> Option<String> {
         }
     }
     found
+}
+
+/// A text layer's Source Text as user-owned projects saved by Premiere 13.0 store it: a
+/// little-endian u64 byte count, then that many bytes of UTF-16LE JSON whose
+/// `mTextParam.mStyleSheet.mText` is the displayed text. `None` for any other payload, and for
+/// a layer with no text.
+fn styled_source_text(bytes: &[u8]) -> Option<String> {
+    let (prefix, body) = bytes.split_first_chunk::<8>()?;
+    if u64::from_le_bytes(*prefix) != body.len() as u64 {
+        return None;
+    }
+    let units: Vec<u16> = body.as_chunks::<2>().0.iter().map(|unit| u16::from_le_bytes(*unit)).collect();
+    let json = String::from_utf16(&units).ok()?;
+    let document: serde_json::Value = serde_json::from_str(json.trim_end_matches('\0')).ok()?;
+    let text = document.pointer("/mTextParam/mStyleSheet/mText")?.as_str()?;
+    (!text.trim().is_empty()).then(|| text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 /// The byte limit for gzip or plain input, and the error that names it.
@@ -1966,6 +1985,19 @@ mod tests {
             assert!(report.mentions("caption text could not be decoded"));
         }
     }
+    #[test]
+    fn source_text_stored_as_utf16_json_is_read() {
+        let payload = |json: &str| {
+            let body: Vec<u8> = json.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let mut bytes = (body.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(body);
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let styled = payload(r#"{"mTextParam":{"mStyleSheet":{"mText":"Lower third\rSecond line é"}},"mVersion":1}"#);
+        assert_eq!(caption_text(&styled).as_deref(), Some("Lower third\nSecond line é"));
+        assert_eq!(caption_text(&payload(r#"{"mTextParam":{"mStyleSheet":{"mText":""}}}"#)), None);
+    }
+
     #[test]
     fn caption_unicode_envelope_and_gzip_bomb_bounds() {
         let text = "Maybe it fits\rIt’s a 2 + 2.";
